@@ -22,3 +22,10 @@ export enum GamePhase {
   PLAYING,
   LEADERBOARD,
 }
+
+export enum GameMode {
+  UNSCRAMBLE = 'unscramble',
+  FILL_IN_ONE = 'fill_in_one',
+  FILL_IN_TWO = 'fill_in_two',
+  FILL_IN_THREE = 'fill_in_three',
+}

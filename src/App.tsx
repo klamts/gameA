@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { GamePhase, Player, Question, PlayerProgress } from './types';
+import { GamePhase, Player, Question, PlayerProgress, GameMode } from './types';
 import Card from './components/Card';
 import Button from './components/Button';
 import UsersIcon from './components/icons/UsersIcon';
@@ -24,7 +24,7 @@ const shuffleArray = <T,>(array: T[]): T[] => {
 // --- Sub-Components (no changes needed here, but included for context) ---
 
 interface HomePageProps {
-    onCreateGame: (name: string, questions: Question[]) => void;
+    onCreateGame: (name: string, questions: Question[], gameMode: GameMode) => void;
     onJoinGame: (name: string, roomCode: string) => void;
     isCreating: boolean;
     isJoining: boolean;
@@ -34,6 +34,7 @@ const HomePage: React.FC<HomePageProps> = ({ onCreateGame, onJoinGame, isCreatin
     const [playerName, setPlayerName] = useState('');
     const [joinRoomCode, setJoinRoomCode] = useState('');
     const [questionsJson, setQuestionsJson] = useState(DEFAULT_QUESTIONS);
+    const [gameMode, setGameMode] = useState<GameMode>(GameMode.UNSCRAMBLE);
     const [error, setError] = useState('');
 
     const handleCreate = () => {
@@ -51,10 +52,6 @@ const HomePage: React.FC<HomePageProps> = ({ onCreateGame, onJoinGame, isCreatin
             let questions: Question[];
 
             if (typeof parsedData[0] === 'string') {
-                // New format: Array of URLs
-                if (!parsedData.every(item => typeof item === 'string')) {
-                     throw new Error('Invalid format. If providing a list of URLs, all items must be strings.');
-                }
                 questions = parsedData.map(url => {
                     const fileNameWithExt = url.split('/').pop() || '';
                     const decodedFileName = decodeURIComponent(fileNameWithExt);
@@ -64,14 +61,11 @@ const HomePage: React.FC<HomePageProps> = ({ onCreateGame, onJoinGame, isCreatin
                     }
                     return { audioUrl: url, answer: answer.toUpperCase() };
                 });
-
             } else if (typeof parsedData[0] === 'object' && parsedData[0] !== null) {
-                // Original format: Array of { audioUrl, answer }
                 if (!parsedData.every(q => q && typeof q.audioUrl === 'string' && typeof q.answer === 'string')) {
                      throw new Error('Invalid format. For object lists, each object must have "audioUrl" and "answer" string properties.');
                 }
                 questions = parsedData.map(q => ({...q, answer: q.answer.toUpperCase()}));
-
             } else {
                 throw new Error('Unsupported JSON format. Provide an array of URLs (strings) or an array of {audioUrl, answer} objects.');
             }
@@ -81,7 +75,7 @@ const HomePage: React.FC<HomePageProps> = ({ onCreateGame, onJoinGame, isCreatin
             }
 
             setError('');
-            onCreateGame(playerName, questions);
+            onCreateGame(playerName, questions, gameMode);
 
         } catch (e: any) {
             setError(e.message || 'Invalid JSON format for questions.');
@@ -97,13 +91,32 @@ const HomePage: React.FC<HomePageProps> = ({ onCreateGame, onJoinGame, isCreatin
         onJoinGame(playerName, joinRoomCode.toUpperCase());
     };
 
+    const gameModeOptions = [
+        { id: GameMode.UNSCRAMBLE, label: 'Unscramble' },
+        { id: GameMode.FILL_IN_ONE, label: 'Fill 1 Blank' },
+        { id: GameMode.FILL_IN_TWO, label: 'Fill 2 Blanks' },
+        { id: GameMode.FILL_IN_THREE, label: 'Fill 3 Blanks' },
+    ];
+
     return (
         <div className="w-full max-w-4xl mx-auto grid md:grid-cols-2 gap-8">
             <Card>
                 <h2 className="text-3xl font-bold text-cyan-400 mb-4 text-center">Create Game</h2>
                 <div className="space-y-4">
                     <input type="text" placeholder="Your Name" value={playerName} onChange={e => setPlayerName(e.target.value)} className="w-full bg-gray-800 border border-gray-600 rounded-lg px-4 py-2 focus:ring-2 focus:ring-cyan-500 focus:outline-none"/>
-                    <textarea placeholder="Paste a JSON array of audio URLs here..." value={questionsJson} onChange={e => setQuestionsJson(e.target.value)} rows={8} className="w-full bg-gray-800 border border-gray-600 rounded-lg px-4 py-2 focus:ring-2 focus:ring-cyan-500 focus:outline-none font-mono text-sm"></textarea>
+                    <textarea placeholder="Paste a JSON array of audio URLs here..." value={questionsJson} onChange={e => setQuestionsJson(e.target.value)} rows={5} className="w-full bg-gray-800 border border-gray-600 rounded-lg px-4 py-2 focus:ring-2 focus:ring-cyan-500 focus:outline-none font-mono text-sm"></textarea>
+                    
+                    <div>
+                        <label className="block mb-2 text-sm font-medium text-gray-300">Game Mode</label>
+                        <div className="grid grid-cols-2 gap-2">
+                            {gameModeOptions.map(option => (
+                                <button key={option.id} onClick={() => setGameMode(option.id)} className={`px-3 py-2 text-sm rounded-lg transition-colors ${gameMode === option.id ? 'bg-cyan-500 text-gray-900 font-bold' : 'bg-gray-700 hover:bg-gray-600'}`}>
+                                    {option.label}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                    
                     <Button onClick={handleCreate} className="w-full" disabled={isCreating}>
                         {isCreating ? <LoadingSpinner className="w-6 h-6 mx-auto" /> : 'Create Game'}
                     </Button>
@@ -154,78 +167,221 @@ const LobbyPage: React.FC<LobbyPageProps> = ({ roomCode, players, isHost, onStar
     </Card>
 );
 
+
 interface GamePageProps {
     questions: Question[];
     player: Player;
+    gameMode: GameMode;
     onGameFinish: (finishTime: number) => void;
 }
 
-const GamePage: React.FC<GamePageProps> = ({ questions, player, onGameFinish }) => {
+type Puzzle = {
+    display: (string | null)[];
+    missingIndices: number[];
+    correctChars: string[];
+};
+
+const SKIP_PENALTY = 30000; // 30 seconds
+const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+const createPuzzle = (answer: string, mode: GameMode): Puzzle => {
+    const answerChars = answer.split('');
+    const validIndices = answerChars
+        .map((char, i) => (char !== ' ' ? i : -1))
+        .filter(i => i !== -1);
+
+    let blanks = 0;
+    if (mode === GameMode.FILL_IN_ONE) blanks = 1;
+    if (mode === GameMode.FILL_IN_TWO) blanks = 2;
+    if (mode === GameMode.FILL_IN_THREE) blanks = 3;
+
+    const missingIndices = shuffleArray(validIndices).slice(0, blanks);
+    missingIndices.sort((a,b) => a - b); // Keep order for filling
+
+    const correctChars = missingIndices.map(i => answerChars[i]);
+    const display = [...answerChars];
+    missingIndices.forEach(i => display[i] = null);
+    
+    return { display, missingIndices, correctChars };
+};
+
+
+const GamePage: React.FC<GamePageProps> = ({ questions, player, gameMode, onGameFinish }) => {
     const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
     const [currentAnswer, setCurrentAnswer] = useState('');
     const [startTime] = useState(Date.now());
     const [elapsedTime, setElapsedTime] = useState(0);
     const audioRef = useRef<HTMLAudioElement>(null);
+    const [skippedCount, setSkippedCount] = useState(0);
+
+    // Unscramble mode state
     const [shuffledChars, setShuffledChars] = useState<string[]>([]);
     
-    useEffect(() => {
-      const interval = setInterval(() => {
-        setElapsedTime(Date.now() - startTime);
-      }, 100);
-      return () => clearInterval(interval);
-    }, [startTime]);
+    // Fill-in-blank mode state
+    const [puzzle, setPuzzle] = useState<Puzzle | null>(null);
+    const [choiceChars, setChoiceChars] = useState<string[]>([]);
 
     const currentQuestion = useMemo(() => questions[currentQuestionIndex], [questions, currentQuestionIndex]);
 
     useEffect(() => {
+        const interval = setInterval(() => {
+            setElapsedTime(Date.now() - startTime);
+        }, 100);
+        return () => clearInterval(interval);
+    }, [startTime]);
+
+    useEffect(() => {
       if (currentQuestion) {
-        setShuffledChars(shuffleArray(currentQuestion.answer.split('')));
         setCurrentAnswer('');
+        if (gameMode === GameMode.UNSCRAMBLE) {
+            setShuffledChars(shuffleArray(currentQuestion.answer.replace(/ /g, '').split('')));
+        } else {
+            const newPuzzle = createPuzzle(currentQuestion.answer, gameMode);
+            setPuzzle(newPuzzle);
+            
+            const distractors = shuffleArray(ALPHABET.split(''))
+                .filter(char => !newPuzzle.correctChars.includes(char))
+                .slice(0, 8 - newPuzzle.correctChars.length);
+            
+            setChoiceChars(shuffleArray([...newPuzzle.correctChars, ...distractors]));
+        }
+
         if(audioRef.current) {
             audioRef.current.play().catch(e => console.error("Audio play failed:", e));
         }
       }
-    }, [currentQuestion]);
+    }, [currentQuestion, gameMode]);
     
+    const handleFinish = useCallback((finalSkippedCount: number) => {
+        const baseTime = Date.now() - startTime;
+        const penalty = finalSkippedCount * SKIP_PENALTY;
+        onGameFinish(baseTime + penalty);
+    }, [startTime, onGameFinish]);
+
+    const handleNextQuestion = useCallback(() => {
+        if (currentQuestionIndex < questions.length - 1) {
+            setCurrentQuestionIndex(prev => prev + 1);
+        } else {
+            handleFinish(skippedCount);
+        }
+    }, [currentQuestionIndex, questions.length, skippedCount, handleFinish]);
+    
+    // --- Answer Checking ---
+    useEffect(() => {
+        if (!currentQuestion) return;
+
+        const isAnswerComplete = gameMode === GameMode.UNSCRAMBLE
+            ? currentAnswer.length === currentQuestion.answer.replace(/ /g, '').length
+            : currentAnswer.length === puzzle?.missingIndices.length;
+
+        if (isAnswerComplete) {
+            let isCorrect = false;
+            if (gameMode === GameMode.UNSCRAMBLE) {
+                isCorrect = currentAnswer === currentQuestion.answer.replace(/ /g, '');
+            } else if (puzzle) {
+                isCorrect = currentAnswer === puzzle.correctChars.join('');
+            }
+            
+            if (isCorrect) {
+                setTimeout(() => handleNextQuestion(), 200); // Small delay for user to see success
+            } else {
+                const answerBox = document.getElementById('answer-box');
+                if (answerBox) {
+                    answerBox.classList.add('animate-shake');
+                    setTimeout(() => answerBox.classList.remove('animate-shake'), 500);
+                }
+            }
+        }
+    }, [currentAnswer, currentQuestion, gameMode, puzzle, handleNextQuestion]);
+    
+    // --- Event Handlers ---
     const handleCharClick = (char: string, index: number) => {
         setCurrentAnswer(prev => prev + char);
-        setShuffledChars(prev => prev.filter((_, i) => i !== index));
+        if (gameMode === GameMode.UNSCRAMBLE) {
+            setShuffledChars(prev => prev.filter((_, i) => i !== index));
+        } else {
+             setChoiceChars(prev => prev.filter((_, i) => i !== index));
+        }
     };
     
     const handleUndo = () => {
         if (currentAnswer.length > 0) {
             const lastChar = currentAnswer.slice(-1);
             setCurrentAnswer(prev => prev.slice(0, -1));
-            setShuffledChars(prev => [...prev, lastChar]);
+            if (gameMode === GameMode.UNSCRAMBLE) {
+                setShuffledChars(prev => [...prev, lastChar]);
+            } else {
+                setChoiceChars(prev => shuffleArray([...prev, lastChar]));
+            }
         }
     };
     
     const handleClear = () => {
-        setCurrentAnswer('');
-        setShuffledChars(shuffleArray(currentQuestion.answer.split('')));
-    };
-
-    useEffect(() => {
-      if (currentQuestion && currentAnswer.length === currentQuestion.answer.length) {
-        if (currentAnswer === currentQuestion.answer) {
-          if (currentQuestionIndex < questions.length - 1) {
-            setCurrentQuestionIndex(prev => prev + 1);
-          } else {
-            onGameFinish(Date.now() - startTime);
-          }
-        } else {
-          const answerBox = document.getElementById('answer-box');
-          if (answerBox) {
-            answerBox.classList.add('animate-shake');
-            setTimeout(() => answerBox.classList.remove('animate-shake'), 500);
-          }
+        if (gameMode === GameMode.UNSCRAMBLE) {
+            setShuffledChars(shuffleArray(currentQuestion.answer.replace(/ /g, '').split('')));
+        } else if (puzzle) {
+             const distractors = shuffleArray(ALPHABET.split(''))
+                .filter(char => !puzzle.correctChars.includes(char))
+                .slice(0, 8 - puzzle.correctChars.length);
+            setChoiceChars(shuffleArray([...puzzle.correctChars, ...distractors]));
         }
-      }
-    }, [currentAnswer, currentQuestion, currentQuestionIndex, questions.length, onGameFinish, startTime]);
+        setCurrentAnswer('');
+    };
+    
+    const handleSkip = () => {
+        const newSkippedCount = skippedCount + 1;
+        setSkippedCount(newSkippedCount);
+        if (currentQuestionIndex < questions.length - 1) {
+            setCurrentQuestionIndex(prev => prev + 1);
+        } else {
+            handleFinish(newSkippedCount);
+        }
+    };
     
     if (!currentQuestion) {
-      return <LoadingSpinner />;
+        return <LoadingSpinner />;
     }
+    
+    // --- Render Logic ---
+    const renderAnswerArea = () => {
+        if (gameMode !== GameMode.UNSCRAMBLE && puzzle) {
+            let filledCount = 0;
+            return (
+                <div id="answer-box" className="w-full bg-gray-900/50 rounded-lg min-h-[60px] p-3 flex items-center justify-center flex-wrap gap-2 text-3xl font-bold tracking-widest border-2 border-gray-600">
+                    {puzzle.display.map((char, index) => {
+                        if (char === null) {
+                            const filledChar = currentAnswer[filledCount] || '';
+                            filledCount++;
+                            return <div key={index} className="w-10 h-14 bg-gray-800 border-b-2 border-cyan-400 flex items-center justify-center">{filledChar}</div>;
+                        }
+                        if (char === ' ') {
+                            return <div key={index} className="w-6 h-14" />;
+                        }
+                        return <div key={index} className="w-10 h-14 flex items-center justify-center">{char}</div>;
+                    })}
+                </div>
+            )
+        }
+        // Default unscramble mode
+        return (
+             <div id="answer-box" className="w-full bg-gray-900/50 rounded-lg min-h-[60px] p-3 flex items-center justify-center text-3xl font-bold tracking-widest mb-4 border-2 border-gray-600">
+                {currentAnswer || <span className="text-gray-500">Your Answer</span>}
+            </div>
+        );
+    }
+    
+    const renderChoiceButtons = () => {
+        const chars = gameMode === GameMode.UNSCRAMBLE ? shuffledChars : choiceChars;
+        return (
+             <div className="flex flex-wrap gap-3 justify-center my-6">
+                {chars.map((char, index) => (
+                    <button key={index} onClick={() => handleCharClick(char, index)} className="w-12 h-12 bg-gray-700 text-2xl font-bold rounded-lg hover:bg-cyan-500 hover:text-gray-900 transition-colors">
+                        {char}
+                    </button>
+                ))}
+            </div>
+        )
+    };
 
     return (
         <Card className="w-full max-w-2xl mx-auto">
@@ -240,26 +396,20 @@ const GamePage: React.FC<GamePageProps> = ({ questions, player, onGameFinish }) 
                 </div>
             </div>
             <div className="my-6 text-center">
-                <p className="mb-4 text-gray-300">Listen to the audio and unscramble the letters.</p>
+                <p className="mb-4 text-gray-300">Listen to the audio and {gameMode === GameMode.UNSCRAMBLE ? 'unscramble the letters' : 'fill in the blanks'}.</p>
                 <audio ref={audioRef} src={currentQuestion.audioUrl} controls className="mx-auto" />
             </div>
 
-            <div id="answer-box" className="w-full bg-gray-900/50 rounded-lg min-h-[60px] p-3 flex items-center justify-center text-3xl font-bold tracking-widest mb-4 border-2 border-gray-600">
-                {currentAnswer || <span className="text-gray-500">Your Answer</span>}
-            </div>
-
-            <div className="flex flex-wrap gap-3 justify-center mb-6">
-                {shuffledChars.map((char, index) => (
-                    <button key={index} onClick={() => handleCharClick(char, index)} className="w-12 h-12 bg-gray-700 text-2xl font-bold rounded-lg hover:bg-cyan-500 hover:text-gray-900 transition-colors">
-                        {char}
-                    </button>
-                ))}
-            </div>
+            {renderAnswerArea()}
+            {renderChoiceButtons()}
 
             <div className="flex justify-center gap-4">
                 <Button onClick={handleUndo} variant="secondary">Undo</Button>
                 <Button onClick={handleClear} variant="secondary">Clear</Button>
+                <Button onClick={handleSkip} variant="secondary" className="bg-amber-600 hover:bg-amber-500 focus:ring-amber-400">Skip (+30s)</Button>
             </div>
+            
+            {skippedCount > 0 && <p className="text-center mt-4 text-amber-400">Skipped: {skippedCount} ({skippedCount * (SKIP_PENALTY/1000)}s penalty)</p>}
         </Card>
     );
 };
@@ -270,7 +420,6 @@ interface LeaderboardPageProps {
 }
 
 const LeaderboardPage: React.FC<LeaderboardPageProps> = ({ progress, onPlayAgain }) => {
-    // The server already sorts the leaderboard, but we can sort again just in case
     const sortedProgress = useMemo(() => {
         return [...progress].sort((a, b) => {
             if (a.finishTime === null) return 1;
@@ -318,6 +467,7 @@ export default function App() {
   const [roomCode, setRoomCode] = useState<string>('');
   const [players, setPlayers] = useState<Player[]>([]);
   const [questions, setQuestions] = useState<Question[]>([]);
+  const [gameMode, setGameMode] = useState<GameMode>(GameMode.UNSCRAMBLE);
   const [currentPlayer, setCurrentPlayer] = useState<Player | null>(null);
   const [playerProgress, setPlayerProgress] = useState<PlayerProgress[]>([]);
   const [isLoading, setIsLoading] = useState({ creating: false, joining: false });
@@ -337,7 +487,7 @@ export default function App() {
   useEffect(() => {
     socket.on('connect', () => console.log(`Connected to server with id: ${socket.id}`));
     socket.on('disconnect', () => {
-      alert('Connection to server lost.');
+      alert('Connection to server lost. Resetting app.');
       handlePlayAgain();
     });
 
@@ -345,32 +495,40 @@ export default function App() {
       setRoomCode(room.roomCode);
       setPlayers(room.players);
       setQuestions(room.questions);
+      setGameMode(room.gameMode || GameMode.UNSCRAMBLE);
       const hostPlayer = room.players.find((p: Player) => p.isHost);
       setCurrentPlayer(hostPlayer);
       setGamePhase(GamePhase.LOBBY);
       setIsLoading(prev => ({ ...prev, creating: false }));
     });
 
-    socket.on('update-player-list', (updatedPlayers: Player[]) => {
-      setPlayers(updatedPlayers);
-      // If we were trying to join, find ourself in the new player list
-      if (joiningPlayerName.current) {
-        const me = updatedPlayers.find(p => p.name === joiningPlayerName.current);
-        if (me) {
-          setCurrentPlayer(me);
-          setGamePhase(GamePhase.LOBBY);
-          setIsLoading(prev => ({ ...prev, joining: false }));
-          joiningPlayerName.current = null; // Clear after successful join
-        }
-      }
+    socket.on('join-success', (room) => {
+        setRoomCode(room.roomCode);
+        setPlayers(room.players);
+        setQuestions(room.questions);
+        setGameMode(room.gameMode || GameMode.UNSCRAMBLE);
+        const me = room.players.find((p: Player) => p.id === socket.id);
+        setCurrentPlayer(me);
+        setGamePhase(GamePhase.LOBBY);
+        setIsLoading(prev => ({...prev, joining: false}));
     });
 
-    socket.on('questions', (serverQuestions: Question[]) => {
-      setQuestions(serverQuestions);
+    socket.on('update-player-list', (updatedPlayers: Player[]) => {
+      setPlayers(updatedPlayers);
+    });
+
+    socket.on('host-changed', ({ newHostId, players: updatedPlayers }) => {
+        setPlayers(updatedPlayers);
+        if (socket.id === newHostId) {
+            alert("The host has left. You are the new host!");
+        }
+        const me = updatedPlayers.find(p => p.id === socket.id);
+        if (me) setCurrentPlayer(me);
     });
     
-    socket.on('game-started', ({ questions: serverQuestions }) => {
+    socket.on('game-started', ({ questions: serverQuestions, gameMode: serverGameMode }) => {
       setQuestions(serverQuestions);
+      setGameMode(serverGameMode || GameMode.UNSCRAMBLE);
       setPlayerProgress(players.map(p => ({ playerId: p.id, name: p.name, finishTime: null })));
       setGamePhase(GamePhase.PLAYING);
     });
@@ -386,7 +544,6 @@ export default function App() {
 
     socket.on('error', (message: string) => {
       alert(`Error: ${message}`);
-      // If host leaves, everyone is kicked
       if (message.includes('Host has left')) {
         handlePlayAgain();
       }
@@ -398,8 +555,9 @@ export default function App() {
       socket.off('connect');
       socket.off('disconnect');
       socket.off('room-created');
+      socket.off('join-success');
       socket.off('update-player-list');
-      socket.off('questions');
+      socket.off('host-changed');
       socket.off('game-started');
       socket.off('update-progress');
       socket.off('game-finished');
@@ -407,9 +565,9 @@ export default function App() {
     };
   }, [players, handlePlayAgain]);
 
-  const handleCreateGame = useCallback((name: string, questionsData: Question[]) => {
+  const handleCreateGame = useCallback((name: string, questionsData: Question[], mode: GameMode) => {
     setIsLoading(prev => ({ ...prev, creating: true }));
-    socket.emit('createRoom', { playerName: name, questions: questionsData });
+    socket.emit('createRoom', { playerName: name, questions: questionsData, gameMode: mode });
   }, []);
 
   const handleJoinGame = useCallback((name: string, room: string) => {
@@ -419,6 +577,8 @@ export default function App() {
     socket.emit('joinRoom', { playerName: name, roomCode: room });
   }, []);
 
+
+
   const handleStartGame = useCallback(() => {
     socket.emit('startGame', { roomCode });
   }, [roomCode]);
@@ -426,7 +586,6 @@ export default function App() {
   const handleGameFinish = useCallback((finishTime: number) => {
     if (!currentPlayer) return;
     socket.emit('playerFinished', { roomCode, finishTime });
-    // Update local state immediately for a responsive feel
     setPlayerProgress(prev => 
         prev.map(p => p.playerId === currentPlayer.id ? {...p, finishTime} : p)
     );
@@ -437,7 +596,7 @@ export default function App() {
       case GamePhase.LOBBY:
         return <LobbyPage roomCode={roomCode} players={players} isHost={currentPlayer?.isHost ?? false} onStartGame={handleStartGame} />;
       case GamePhase.PLAYING:
-        return currentPlayer && <GamePage questions={questions} player={currentPlayer} onGameFinish={handleGameFinish} />;
+        return currentPlayer && <GamePage questions={questions} player={currentPlayer} onGameFinish={handleGameFinish} gameMode={gameMode} />;
       case GamePhase.LEADERBOARD:
         return <LeaderboardPage progress={playerProgress} onPlayAgain={handlePlayAgain} />;
       case GamePhase.HOME:
