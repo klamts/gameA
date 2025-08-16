@@ -1,0 +1,459 @@
+import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
+import { io, Socket } from 'socket.io-client';
+import { GamePhase, Player, Question, PlayerProgress } from './types';
+import Card from './components/Card';
+import Button from './components/Button';
+import UsersIcon from './components/icons/UsersIcon';
+import TrophyIcon from './components/icons/TrophyIcon';
+import LoadingSpinner from './components/LoadingSpinner';
+
+// IMPORTANT: Replace this with your actual Render backend URL
+const SERVER_URL = "https://audio-scramble-showdown-nodejs.onrender.com";
+const socket: Socket = io(SERVER_URL);
+
+const DEFAULT_QUESTIONS = JSON.stringify([
+  "https://raw.githubusercontent.com/klamts/flashcard-library/main/decks/audio/flashcard_unit2/Antarctica.mp3",
+  "https://raw.githubusercontent.com/klamts/flashcard-library/main/decks/audio/flashcard_unit2/a%20doctor.mp3",
+  "https://raw.githubusercontent.com/klamts/flashcard-library/main/decks/audio/flashcard_unit2/watch%20movies.mp3"
+], null, 2);
+
+const shuffleArray = <T,>(array: T[]): T[] => {
+  return [...array].sort(() => Math.random() - 0.5);
+};
+
+// --- Sub-Components (no changes needed here, but included for context) ---
+
+interface HomePageProps {
+    onCreateGame: (name: string, questions: Question[]) => void;
+    onJoinGame: (name: string, roomCode: string) => void;
+    isCreating: boolean;
+    isJoining: boolean;
+}
+
+const HomePage: React.FC<HomePageProps> = ({ onCreateGame, onJoinGame, isCreating, isJoining }) => {
+    const [playerName, setPlayerName] = useState('');
+    const [joinRoomCode, setJoinRoomCode] = useState('');
+    const [questionsJson, setQuestionsJson] = useState(DEFAULT_QUESTIONS);
+    const [error, setError] = useState('');
+
+    const handleCreate = () => {
+        if (!playerName.trim()) {
+            setError('Please enter your name.');
+            return;
+        }
+        try {
+            const parsedData = JSON.parse(questionsJson);
+            
+            if (!Array.isArray(parsedData) || parsedData.length === 0) {
+                throw new Error('Input must be a non-empty JSON array.');
+            }
+
+            let questions: Question[];
+
+            if (typeof parsedData[0] === 'string') {
+                // New format: Array of URLs
+                if (!parsedData.every(item => typeof item === 'string')) {
+                     throw new Error('Invalid format. If providing a list of URLs, all items must be strings.');
+                }
+                questions = parsedData.map(url => {
+                    const fileNameWithExt = url.split('/').pop() || '';
+                    const decodedFileName = decodeURIComponent(fileNameWithExt);
+                    const answer = decodedFileName.substring(0, decodedFileName.lastIndexOf('.')) || decodedFileName;
+                    if (!answer) {
+                      throw new Error(`Could not determine answer from URL: ${url}`);
+                    }
+                    return { audioUrl: url, answer: answer.toUpperCase() };
+                });
+
+            } else if (typeof parsedData[0] === 'object' && parsedData[0] !== null) {
+                // Original format: Array of { audioUrl, answer }
+                if (!parsedData.every(q => q && typeof q.audioUrl === 'string' && typeof q.answer === 'string')) {
+                     throw new Error('Invalid format. For object lists, each object must have "audioUrl" and "answer" string properties.');
+                }
+                questions = parsedData.map(q => ({...q, answer: q.answer.toUpperCase()}));
+
+            } else {
+                throw new Error('Unsupported JSON format. Provide an array of URLs (strings) or an array of {audioUrl, answer} objects.');
+            }
+            
+            if (questions.length === 0) {
+               throw new Error('No valid questions could be processed.');
+            }
+
+            setError('');
+            onCreateGame(playerName, questions);
+
+        } catch (e: any) {
+            setError(e.message || 'Invalid JSON format for questions.');
+        }
+    };
+    
+    const handleJoin = () => {
+        if (!playerName.trim() || !joinRoomCode.trim()) {
+            setError('Please enter your name and a room code.');
+            return;
+        }
+        setError('');
+        onJoinGame(playerName, joinRoomCode.toUpperCase());
+    };
+
+    return (
+        <div className="w-full max-w-4xl mx-auto grid md:grid-cols-2 gap-8">
+            <Card>
+                <h2 className="text-3xl font-bold text-cyan-400 mb-4 text-center">Create Game</h2>
+                <div className="space-y-4">
+                    <input type="text" placeholder="Your Name" value={playerName} onChange={e => setPlayerName(e.target.value)} className="w-full bg-gray-800 border border-gray-600 rounded-lg px-4 py-2 focus:ring-2 focus:ring-cyan-500 focus:outline-none"/>
+                    <textarea placeholder="Paste a JSON array of audio URLs here..." value={questionsJson} onChange={e => setQuestionsJson(e.target.value)} rows={8} className="w-full bg-gray-800 border border-gray-600 rounded-lg px-4 py-2 focus:ring-2 focus:ring-cyan-500 focus:outline-none font-mono text-sm"></textarea>
+                    <Button onClick={handleCreate} className="w-full" disabled={isCreating}>
+                        {isCreating ? <LoadingSpinner className="w-6 h-6 mx-auto" /> : 'Create Game'}
+                    </Button>
+                </div>
+            </Card>
+            <Card>
+                <h2 className="text-3xl font-bold text-pink-400 mb-4 text-center">Join Game</h2>
+                <div className="space-y-4">
+                     <input type="text" placeholder="Your Name" value={playerName} onChange={e => setPlayerName(e.target.value)} className="w-full bg-gray-800 border border-gray-600 rounded-lg px-4 py-2 focus:ring-2 focus:ring-pink-500 focus:outline-none"/>
+                     <input type="text" placeholder="Room Code" value={joinRoomCode} onChange={e => setJoinRoomCode(e.target.value.toUpperCase())} className="w-full bg-gray-800 border border-gray-600 rounded-lg px-4 py-2 focus:ring-2 focus:ring-pink-500 focus:outline-none"/>
+                     <Button onClick={handleJoin} className="w-full bg-pink-500 hover:bg-pink-400 focus:ring-pink-300" disabled={isJoining}>
+                        {isJoining ? <LoadingSpinner className="w-6 h-6 mx-auto" /> : 'Join Game'}
+                    </Button>
+                </div>
+            </Card>
+            {error && <p className="text-red-400 md:col-span-2 text-center mt-4">{error}</p>}
+        </div>
+    );
+};
+
+interface LobbyPageProps {
+    roomCode: string;
+    players: Player[];
+    isHost: boolean;
+    onStartGame: () => void;
+}
+
+const LobbyPage: React.FC<LobbyPageProps> = ({ roomCode, players, isHost, onStartGame }) => (
+    <Card className="w-full max-w-md mx-auto text-center">
+        <h2 className="text-2xl font-bold text-gray-300">Room Code</h2>
+        <p className="text-5xl font-mono tracking-widest text-cyan-400 my-4 bg-gray-800 rounded-lg py-2 break-all">{roomCode}</p>
+        <div className="my-8">
+            <h3 className="text-xl font-semibold mb-4 flex items-center justify-center gap-2"><UsersIcon /> Players ({players.length})</h3>
+            <ul className="space-y-2">
+                {players.map(p => (
+                    <li key={p.id} className="bg-gray-700/50 rounded-lg px-4 py-2 text-lg flex items-center justify-between">
+                        <span>{p.name}</span>
+                        {p.isHost && <span className="text-xs font-bold text-cyan-400 bg-cyan-900/50 px-2 py-1 rounded-full">HOST</span>}
+                    </li>
+                ))}
+            </ul>
+        </div>
+        {isHost ? (
+            <Button onClick={onStartGame} className="w-full" disabled={players.length < 1}>Start Game</Button>
+        ) : (
+            <p className="text-gray-400 animate-pulse">Waiting for host to start the game...</p>
+        )}
+    </Card>
+);
+
+interface GamePageProps {
+    questions: Question[];
+    player: Player;
+    onGameFinish: (finishTime: number) => void;
+}
+
+const GamePage: React.FC<GamePageProps> = ({ questions, player, onGameFinish }) => {
+    const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+    const [currentAnswer, setCurrentAnswer] = useState('');
+    const [startTime] = useState(Date.now());
+    const [elapsedTime, setElapsedTime] = useState(0);
+    const audioRef = useRef<HTMLAudioElement>(null);
+    const [shuffledChars, setShuffledChars] = useState<string[]>([]);
+    
+    useEffect(() => {
+      const interval = setInterval(() => {
+        setElapsedTime(Date.now() - startTime);
+      }, 100);
+      return () => clearInterval(interval);
+    }, [startTime]);
+
+    const currentQuestion = useMemo(() => questions[currentQuestionIndex], [questions, currentQuestionIndex]);
+
+    useEffect(() => {
+      if (currentQuestion) {
+        setShuffledChars(shuffleArray(currentQuestion.answer.split('')));
+        setCurrentAnswer('');
+        if(audioRef.current) {
+            audioRef.current.play().catch(e => console.error("Audio play failed:", e));
+        }
+      }
+    }, [currentQuestion]);
+    
+    const handleCharClick = (char: string, index: number) => {
+        setCurrentAnswer(prev => prev + char);
+        setShuffledChars(prev => prev.filter((_, i) => i !== index));
+    };
+    
+    const handleUndo = () => {
+        if (currentAnswer.length > 0) {
+            const lastChar = currentAnswer.slice(-1);
+            setCurrentAnswer(prev => prev.slice(0, -1));
+            setShuffledChars(prev => [...prev, lastChar]);
+        }
+    };
+    
+    const handleClear = () => {
+        setCurrentAnswer('');
+        setShuffledChars(shuffleArray(currentQuestion.answer.split('')));
+    };
+
+    useEffect(() => {
+      if (currentQuestion && currentAnswer.length === currentQuestion.answer.length) {
+        if (currentAnswer === currentQuestion.answer) {
+          if (currentQuestionIndex < questions.length - 1) {
+            setCurrentQuestionIndex(prev => prev + 1);
+          } else {
+            onGameFinish(Date.now() - startTime);
+          }
+        } else {
+          const answerBox = document.getElementById('answer-box');
+          if (answerBox) {
+            answerBox.classList.add('animate-shake');
+            setTimeout(() => answerBox.classList.remove('animate-shake'), 500);
+          }
+        }
+      }
+    }, [currentAnswer, currentQuestion, currentQuestionIndex, questions.length, onGameFinish, startTime]);
+    
+    if (!currentQuestion) {
+      return <LoadingSpinner />;
+    }
+
+    return (
+        <Card className="w-full max-w-2xl mx-auto">
+            <style>{`
+            @keyframes shake { 0%, 100% { transform: translateX(0); } 10%, 30%, 50%, 70%, 90% { transform: translateX(-5px); } 20%, 40%, 60%, 80% { transform: translateX(5px); } }
+            .animate-shake { animation: shake 0.5s ease-in-out; }
+            `}</style>
+            <div className="flex justify-between items-center mb-4">
+                <h2 className="text-xl font-bold text-cyan-400">Question {currentQuestionIndex + 1} / {questions.length}</h2>
+                <div className="text-2xl font-mono text-white bg-gray-800 px-3 py-1 rounded-lg">
+                    {new Date(elapsedTime).toISOString().slice(14, 22)}
+                </div>
+            </div>
+            <div className="my-6 text-center">
+                <p className="mb-4 text-gray-300">Listen to the audio and unscramble the letters.</p>
+                <audio ref={audioRef} src={currentQuestion.audioUrl} controls className="mx-auto" />
+            </div>
+
+            <div id="answer-box" className="w-full bg-gray-900/50 rounded-lg min-h-[60px] p-3 flex items-center justify-center text-3xl font-bold tracking-widest mb-4 border-2 border-gray-600">
+                {currentAnswer || <span className="text-gray-500">Your Answer</span>}
+            </div>
+
+            <div className="flex flex-wrap gap-3 justify-center mb-6">
+                {shuffledChars.map((char, index) => (
+                    <button key={index} onClick={() => handleCharClick(char, index)} className="w-12 h-12 bg-gray-700 text-2xl font-bold rounded-lg hover:bg-cyan-500 hover:text-gray-900 transition-colors">
+                        {char}
+                    </button>
+                ))}
+            </div>
+
+            <div className="flex justify-center gap-4">
+                <Button onClick={handleUndo} variant="secondary">Undo</Button>
+                <Button onClick={handleClear} variant="secondary">Clear</Button>
+            </div>
+        </Card>
+    );
+};
+
+interface LeaderboardPageProps {
+    progress: PlayerProgress[];
+    onPlayAgain: () => void;
+}
+
+const LeaderboardPage: React.FC<LeaderboardPageProps> = ({ progress, onPlayAgain }) => {
+    // The server already sorts the leaderboard, but we can sort again just in case
+    const sortedProgress = useMemo(() => {
+        return [...progress].sort((a, b) => {
+            if (a.finishTime === null) return 1;
+            if (b.finishTime === null) return -1;
+            return a.finishTime - b.finishTime;
+        });
+    }, [progress]);
+
+    const getPodiumClass = (index: number) => {
+        switch (index) {
+            case 0: return "bg-gradient-to-r from-amber-400 to-yellow-500 scale-110";
+            case 1: return "bg-gradient-to-r from-slate-300 to-gray-400";
+            case 2: return "bg-gradient-to-r from-yellow-700 to-orange-800";
+            default: return "bg-gray-700";
+        }
+    };
+
+    return (
+        <Card className="w-full max-w-lg mx-auto text-center">
+            <TrophyIcon className="w-16 h-16 mx-auto text-yellow-400 mb-4" />
+            <h2 className="text-4xl font-bold mb-8">Final Results</h2>
+            <div className="space-y-3">
+                {sortedProgress.map((p, index) => (
+                    <div key={p.playerId} className={`flex items-center justify-between p-4 rounded-lg shadow-lg text-gray-900 font-bold ${getPodiumClass(index)}`}>
+                        <div className="flex items-center gap-4">
+                            <span className="text-2xl w-8">{index + 1}</span>
+                            <span className="text-xl">{p.name}</span>
+                        </div>
+                        <span className="text-lg font-mono">
+                            {p.finishTime !== null ? new Date(p.finishTime).toISOString().slice(14, 22) : 'DNF'}
+                        </span>
+                    </div>
+                ))}
+            </div>
+            <Button onClick={onPlayAgain} className="mt-8 w-full">Play Again</Button>
+        </Card>
+    );
+};
+
+
+// --- Main App Component ---
+
+export default function App() {
+  const [gamePhase, setGamePhase] = useState<GamePhase>(GamePhase.HOME);
+  const [roomCode, setRoomCode] = useState<string>('');
+  const [players, setPlayers] = useState<Player[]>([]);
+  const [questions, setQuestions] = useState<Question[]>([]);
+  const [currentPlayer, setCurrentPlayer] = useState<Player | null>(null);
+  const [playerProgress, setPlayerProgress] = useState<PlayerProgress[]>([]);
+  const [isLoading, setIsLoading] = useState({ creating: false, joining: false });
+  const joiningPlayerName = useRef<string | null>(null);
+
+  const handlePlayAgain = useCallback(() => {
+      setGamePhase(GamePhase.HOME);
+      setRoomCode('');
+      setPlayers([]);
+      setQuestions([]);
+      setCurrentPlayer(null);
+      setPlayerProgress([]);
+      setIsLoading({ creating: false, joining: false });
+      joiningPlayerName.current = null;
+  }, []);
+
+  useEffect(() => {
+    socket.on('connect', () => console.log(`Connected to server with id: ${socket.id}`));
+    socket.on('disconnect', () => {
+      alert('Connection to server lost.');
+      handlePlayAgain();
+    });
+
+    socket.on('room-created', (room) => {
+      setRoomCode(room.roomCode);
+      setPlayers(room.players);
+      setQuestions(room.questions);
+      const hostPlayer = room.players.find((p: Player) => p.isHost);
+      setCurrentPlayer(hostPlayer);
+      setGamePhase(GamePhase.LOBBY);
+      setIsLoading(prev => ({ ...prev, creating: false }));
+    });
+
+    socket.on('update-player-list', (updatedPlayers: Player[]) => {
+      setPlayers(updatedPlayers);
+      // If we were trying to join, find ourself in the new player list
+      if (joiningPlayerName.current) {
+        const me = updatedPlayers.find(p => p.name === joiningPlayerName.current);
+        if (me) {
+          setCurrentPlayer(me);
+          setGamePhase(GamePhase.LOBBY);
+          setIsLoading(prev => ({ ...prev, joining: false }));
+          joiningPlayerName.current = null; // Clear after successful join
+        }
+      }
+    });
+
+    socket.on('questions', (serverQuestions: Question[]) => {
+      setQuestions(serverQuestions);
+    });
+    
+    socket.on('game-started', ({ questions: serverQuestions }) => {
+      setQuestions(serverQuestions);
+      setPlayerProgress(players.map(p => ({ playerId: p.id, name: p.name, finishTime: null })));
+      setGamePhase(GamePhase.PLAYING);
+    });
+
+    socket.on('update-progress', (progress: PlayerProgress[]) => {
+      setPlayerProgress(progress);
+    });
+
+    socket.on('game-finished', (leaderboard: PlayerProgress[]) => {
+      setPlayerProgress(leaderboard);
+      setTimeout(() => setGamePhase(GamePhase.LEADERBOARD), 500);
+    });
+
+    socket.on('error', (message: string) => {
+      alert(`Error: ${message}`);
+      // If host leaves, everyone is kicked
+      if (message.includes('Host has left')) {
+        handlePlayAgain();
+      }
+      setIsLoading({ creating: false, joining: false });
+      joiningPlayerName.current = null;
+    });
+
+    return () => {
+      socket.off('connect');
+      socket.off('disconnect');
+      socket.off('room-created');
+      socket.off('update-player-list');
+      socket.off('questions');
+      socket.off('game-started');
+      socket.off('update-progress');
+      socket.off('game-finished');
+      socket.off('error');
+    };
+  }, [players, handlePlayAgain]);
+
+  const handleCreateGame = useCallback((name: string, questionsData: Question[]) => {
+    setIsLoading(prev => ({ ...prev, creating: true }));
+    socket.emit('createRoom', { playerName: name, questions: questionsData });
+  }, []);
+
+  const handleJoinGame = useCallback((name: string, room: string) => {
+    setIsLoading(prev => ({ ...prev, joining: true }));
+    setRoomCode(room);
+    joiningPlayerName.current = name;
+    socket.emit('joinRoom', { playerName: name, roomCode: room });
+  }, []);
+
+  const handleStartGame = useCallback(() => {
+    socket.emit('startGame', { roomCode });
+  }, [roomCode]);
+
+  const handleGameFinish = useCallback((finishTime: number) => {
+    if (!currentPlayer) return;
+    socket.emit('playerFinished', { roomCode, finishTime });
+    // Update local state immediately for a responsive feel
+    setPlayerProgress(prev => 
+        prev.map(p => p.playerId === currentPlayer.id ? {...p, finishTime} : p)
+    );
+  }, [currentPlayer, roomCode]);
+
+  const renderContent = () => {
+    switch (gamePhase) {
+      case GamePhase.LOBBY:
+        return <LobbyPage roomCode={roomCode} players={players} isHost={currentPlayer?.isHost ?? false} onStartGame={handleStartGame} />;
+      case GamePhase.PLAYING:
+        return currentPlayer && <GamePage questions={questions} player={currentPlayer} onGameFinish={handleGameFinish} />;
+      case GamePhase.LEADERBOARD:
+        return <LeaderboardPage progress={playerProgress} onPlayAgain={handlePlayAgain} />;
+      case GamePhase.HOME:
+      default:
+        return <HomePage onCreateGame={handleCreateGame} onJoinGame={handleJoinGame} isCreating={isLoading.creating} isJoining={isLoading.joining} />;
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-900 to-blue-900 flex flex-col items-center justify-center p-4 font-sans">
+      <header className="absolute top-0 left-0 p-6">
+        <h1 className="text-2xl font-bold tracking-wider">Audio Scramble <span className="text-cyan-400">Showdown</span></h1>
+      </header>
+      <main className="w-full flex items-center justify-center">
+        {renderContent()}
+      </main>
+    </div>
+  );
+}

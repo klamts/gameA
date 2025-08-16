@@ -1,0 +1,5 @@
+{
+  "name": "Audio Scramble Showdown",
+  "description": "A real-time tournament app where players listen to audio clues and unscramble letters to find the answer. The fastest player to complete all rounds wins!",
+  "requestFramePermissions": []
+}
