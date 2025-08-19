@@ -6,6 +6,7 @@ import Button from './components/Button';
 import UsersIcon from './components/icons/UsersIcon';
 import TrophyIcon from './components/icons/TrophyIcon';
 import LoadingSpinner from './components/LoadingSpinner';
+import MicIcon from './components/icons/MicIcon';
 
 // IMPORTANT: Replace this with your actual Render backend URL
 const SERVER_URL = "https://audio-scramble-showdown-nodejs.onrender.com";
@@ -21,7 +22,7 @@ const shuffleArray = <T,>(array: T[]): T[] => {
   return [...array].sort(() => Math.random() - 0.5);
 };
 
-// --- Sub-Components (no changes needed here, but included for context) ---
+// --- Sub-Components ---
 
 interface HomePageProps {
     onCreateGame: (name: string, questions: Question[], gameMode: GameMode) => void;
@@ -96,6 +97,7 @@ const HomePage: React.FC<HomePageProps> = ({ onCreateGame, onJoinGame, isCreatin
         { id: GameMode.FILL_IN_ONE, label: 'Fill 1 Blank' },
         { id: GameMode.FILL_IN_TWO, label: 'Fill 2 Blanks' },
         { id: GameMode.FILL_IN_THREE, label: 'Fill 3 Blanks' },
+        { id: GameMode.PRONUNCIATION, label: 'Pronunciation' },
     ];
 
     return (
@@ -108,7 +110,7 @@ const HomePage: React.FC<HomePageProps> = ({ onCreateGame, onJoinGame, isCreatin
                     
                     <div>
                         <label className="block mb-2 text-sm font-medium text-gray-300">Game Mode</label>
-                        <div className="grid grid-cols-2 gap-2">
+                        <div className="grid grid-cols-2 lg:grid-cols-3 gap-2">
                             {gameModeOptions.map(option => (
                                 <button key={option.id} onClick={() => setGameMode(option.id)} className={`px-3 py-2 text-sm rounded-lg transition-colors ${gameMode === option.id ? 'bg-cyan-500 text-gray-900 font-bold' : 'bg-gray-700 hover:bg-gray-600'}`}>
                                     {option.label}
@@ -182,7 +184,18 @@ type Puzzle = {
 };
 
 const SKIP_PENALTY = 30000; // 30 seconds
+const HINT_PENALTY = 30000; // 30 seconds for pronunciation hint
 const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+// Web Speech API setup
+const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+let recognition: any | null = null;
+if (SpeechRecognition) {
+    recognition = new SpeechRecognition();
+    recognition.continuous = true;
+    recognition.lang = 'en-US';
+    recognition.interimResults = true;
+}
 
 const createPuzzle = (answer: string, mode: GameMode): Puzzle => {
     const answerChars = answer.split('');
@@ -196,7 +209,7 @@ const createPuzzle = (answer: string, mode: GameMode): Puzzle => {
     if (mode === GameMode.FILL_IN_THREE) blanks = 3;
 
     const missingIndices = shuffleArray(validIndices).slice(0, blanks);
-    missingIndices.sort((a,b) => a - b); // Keep order for filling
+    missingIndices.sort((a,b) => a - b);
 
     const correctChars = missingIndices.map(i => answerChars[i]);
     const display = [...answerChars];
@@ -205,21 +218,22 @@ const createPuzzle = (answer: string, mode: GameMode): Puzzle => {
     return { display, missingIndices, correctChars };
 };
 
-
 const GamePage: React.FC<GamePageProps> = ({ questions, player, gameMode, onGameFinish }) => {
     const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
     const [currentAnswer, setCurrentAnswer] = useState('');
     const [startTime] = useState(Date.now());
     const [elapsedTime, setElapsedTime] = useState(0);
     const audioRef = useRef<HTMLAudioElement>(null);
-    const [skippedCount, setSkippedCount] = useState(0);
+    const [penalty, setPenalty] = useState(0);
 
-    // Unscramble mode state
+    // Unscramble & Fill-in-blank state
     const [shuffledChars, setShuffledChars] = useState<string[]>([]);
-    
-    // Fill-in-blank mode state
     const [puzzle, setPuzzle] = useState<Puzzle | null>(null);
     const [choiceChars, setChoiceChars] = useState<string[]>([]);
+    
+    // Pronunciation mode state
+    const [transcript, setTranscript] = useState('');
+    const [isListening, setIsListening] = useState(false);
 
     const currentQuestion = useMemo(() => questions[currentQuestionIndex], [questions, currentQuestionIndex]);
 
@@ -230,45 +244,51 @@ const GamePage: React.FC<GamePageProps> = ({ questions, player, gameMode, onGame
         return () => clearInterval(interval);
     }, [startTime]);
 
-    useEffect(() => {
-      if (currentQuestion) {
+    const setupQuestion = useCallback((question: Question) => {
         setCurrentAnswer('');
+        setTranscript('');
+
         if (gameMode === GameMode.UNSCRAMBLE) {
-            setShuffledChars(shuffleArray(currentQuestion.answer.replace(/ /g, '').split('')));
-        } else {
-            const newPuzzle = createPuzzle(currentQuestion.answer, gameMode);
+            setShuffledChars(shuffleArray(question.answer.replace(/ /g, '').split('')));
+        } else if (gameMode === GameMode.PRONUNCIATION) {
+            // Pronunciation mode setup is handled by its own UI
+        } else { // Fill-in-the-blank modes
+            const newPuzzle = createPuzzle(question.answer, gameMode);
             setPuzzle(newPuzzle);
-            
             const distractors = shuffleArray(ALPHABET.split(''))
                 .filter(char => !newPuzzle.correctChars.includes(char))
                 .slice(0, 8 - newPuzzle.correctChars.length);
-            
             setChoiceChars(shuffleArray([...newPuzzle.correctChars, ...distractors]));
         }
 
-        if(audioRef.current) {
+        if (gameMode !== GameMode.PRONUNCIATION && audioRef.current) {
             audioRef.current.play().catch(e => console.error("Audio play failed:", e));
         }
+    }, [gameMode]);
+
+    useEffect(() => {
+      if (currentQuestion) {
+        setupQuestion(currentQuestion);
       }
-    }, [currentQuestion, gameMode]);
+    }, [currentQuestion, setupQuestion]);
     
-    const handleFinish = useCallback((finalSkippedCount: number) => {
+    const handleFinish = useCallback((finalPenalty: number) => {
         const baseTime = Date.now() - startTime;
-        const penalty = finalSkippedCount * SKIP_PENALTY;
-        onGameFinish(baseTime + penalty);
+        onGameFinish(baseTime + finalPenalty);
     }, [startTime, onGameFinish]);
 
     const handleNextQuestion = useCallback(() => {
+        if (isListening) recognition?.stop();
         if (currentQuestionIndex < questions.length - 1) {
             setCurrentQuestionIndex(prev => prev + 1);
         } else {
-            handleFinish(skippedCount);
+            handleFinish(penalty);
         }
-    }, [currentQuestionIndex, questions.length, skippedCount, handleFinish]);
+    }, [currentQuestionIndex, questions.length, penalty, handleFinish, isListening]);
     
     // --- Answer Checking ---
     useEffect(() => {
-        if (!currentQuestion) return;
+        if (!currentQuestion || gameMode === GameMode.PRONUNCIATION) return;
 
         const isAnswerComplete = gameMode === GameMode.UNSCRAMBLE
             ? currentAnswer.length === currentQuestion.answer.replace(/ /g, '').length
@@ -283,7 +303,7 @@ const GamePage: React.FC<GamePageProps> = ({ questions, player, gameMode, onGame
             }
             
             if (isCorrect) {
-                setTimeout(() => handleNextQuestion(), 200); // Small delay for user to see success
+                setTimeout(() => handleNextQuestion(), 200);
             } else {
                 const answerBox = document.getElementById('answer-box');
                 if (answerBox) {
@@ -293,6 +313,55 @@ const GamePage: React.FC<GamePageProps> = ({ questions, player, gameMode, onGame
             }
         }
     }, [currentAnswer, currentQuestion, gameMode, puzzle, handleNextQuestion]);
+
+    // --- Pronunciation Logic ---
+    useEffect(() => {
+        if (!recognition || gameMode !== GameMode.PRONUNCIATION) return;
+
+        recognition.onresult = (event: any) => {
+            let interimTranscript = '';
+            let finalTranscript = '';
+            for (let i = event.resultIndex; i < event.results.length; ++i) {
+                if (event.results[i].isFinal) {
+                    finalTranscript += event.results[i][0].transcript;
+                } else {
+                    interimTranscript += event.results[i][0].transcript;
+                }
+            }
+            setTranscript(finalTranscript + interimTranscript);
+        };
+        
+        recognition.onend = () => {
+            setIsListening(false);
+        };
+
+        return () => {
+            recognition?.stop();
+        }
+    }, [gameMode]);
+
+    const toggleListen = () => {
+        if (isListening) {
+            recognition?.stop();
+        } else {
+            setTranscript('');
+            recognition?.start();
+        }
+        setIsListening(!isListening);
+    };
+
+    const handlePronunciationSubmit = () => {
+        const clean = (text: string) => text.toLowerCase().replace(/[.,?\/#!$%^&*;:{}=\-_`~()]/g, "").trim();
+        if (clean(transcript) === clean(currentQuestion.answer)) {
+            handleNextQuestion();
+        } else {
+            const answerBox = document.getElementById('pronunciation-feedback');
+            if (answerBox) {
+                answerBox.classList.add('animate-shake');
+                setTimeout(() => answerBox.classList.remove('animate-shake'), 500);
+            }
+        }
+    };
     
     // --- Event Handlers ---
     const handleCharClick = (char: string, index: number) => {
@@ -329,87 +398,138 @@ const GamePage: React.FC<GamePageProps> = ({ questions, player, gameMode, onGame
     };
     
     const handleSkip = () => {
-        const newSkippedCount = skippedCount + 1;
-        setSkippedCount(newSkippedCount);
+        const newPenalty = penalty + SKIP_PENALTY;
+        setPenalty(newPenalty);
         if (currentQuestionIndex < questions.length - 1) {
             setCurrentQuestionIndex(prev => prev + 1);
         } else {
-            handleFinish(newSkippedCount);
+            handleFinish(newPenalty);
         }
     };
     
+    const handleHint = () => {
+        if(audioRef.current) {
+            audioRef.current.currentTime = 0;
+            audioRef.current.play();
+            setPenalty(prev => prev + HINT_PENALTY);
+        }
+    };
+
     if (!currentQuestion) {
         return <LoadingSpinner />;
     }
     
     // --- Render Logic ---
-    const renderAnswerArea = () => {
-        if (gameMode !== GameMode.UNSCRAMBLE && puzzle) {
-            let filledCount = 0;
-            return (
-                <div id="answer-box" className="w-full bg-gray-900/50 rounded-lg min-h-[60px] p-3 flex items-center justify-center flex-wrap gap-2 text-3xl font-bold tracking-widest border-2 border-gray-600">
-                    {puzzle.display.map((char, index) => {
-                        if (char === null) {
-                            const filledChar = currentAnswer[filledCount] || '';
-                            filledCount++;
-                            return <div key={index} className="w-10 h-14 bg-gray-800 border-b-2 border-cyan-400 flex items-center justify-center">{filledChar}</div>;
-                        }
-                        if (char === ' ') {
-                            return <div key={index} className="w-6 h-14" />;
-                        }
-                        return <div key={index} className="w-10 h-14 flex items-center justify-center">{char}</div>;
-                    })}
-                </div>
-            )
+    const renderPronunciationFeedback = () => {
+        if (!transcript) {
+            return <span className="text-gray-500">Your spoken text will appear here...</span>;
         }
-        // Default unscramble mode
+
+        const clean = (text: string) => text.toLowerCase().replace(/[.,?\/#!$%^&*;:{}=\-_`~()]/g,"");
+
+        const answerWords = clean(currentQuestion.answer).split(/\s+/).filter(Boolean);
+        const transcriptWords = transcript.split(/\s+/).filter(Boolean);
+
+        return transcriptWords.map((word, index) => {
+            const isCorrect = answerWords[index] === clean(word);
+            const color = isCorrect ? 'text-green-400' : 'text-red-400';
+            return <span key={index} className={`${color} transition-colors`}>{word} </span>;
+        });
+    };
+
+    const renderGameContent = () => {
+        if (gameMode === GameMode.PRONUNCIATION) {
+            return (
+                <div>
+                    <p className="mb-2 text-gray-300 text-center">Read the following phrase aloud:</p>
+                    <div id="answer-box" className="w-full bg-gray-900/50 rounded-lg p-4 mb-4 text-3xl text-center font-bold tracking-wider border-2 border-gray-600">
+                       {currentQuestion.answer}
+                    </div>
+
+                    <div id="pronunciation-feedback" className="w-full bg-gray-900/50 rounded-lg min-h-[60px] p-4 text-2xl text-center border-2 border-gray-600 mb-6">
+                        {renderPronunciationFeedback()}
+                    </div>
+
+                    <div className="flex justify-center items-center gap-4">
+                       <Button onClick={handleHint} variant="secondary" className="bg-purple-600 hover:bg-purple-500 focus:ring-purple-400">Hint (-30s)</Button>
+                       <button onClick={toggleListen} className={`p-4 rounded-full transition-all duration-300 ${isListening ? 'bg-red-500 animate-pulse' : 'bg-cyan-500'}`}>
+                           <MicIcon className="w-8 h-8 text-gray-900" />
+                       </button>
+                       <Button onClick={handlePronunciationSubmit} disabled={!transcript || isListening}>Submit</Button>
+                    </div>
+                    <div className="flex justify-center mt-4">
+                        <Button onClick={handleSkip} variant="secondary" className="bg-amber-600 hover:bg-amber-500 focus:ring-amber-400">Skip (+30s)</Button>
+                    </div>
+                </div>
+            );
+        }
+
+        // Unscramble and Fill-in-the-blank modes
         return (
-             <div id="answer-box" className="w-full bg-gray-900/50 rounded-lg min-h-[60px] p-3 flex items-center justify-center text-3xl font-bold tracking-widest mb-4 border-2 border-gray-600">
-                {currentAnswer || <span className="text-gray-500">Your Answer</span>}
+            <div>
+                <div className="my-6 text-center">
+                    <p className="mb-4 text-gray-300">Listen to the audio and {gameMode === GameMode.UNSCRAMBLE ? 'unscramble the letters' : 'fill in the blanks'}.</p>
+                    <audio ref={audioRef} src={currentQuestion.audioUrl} controls className="mx-auto" />
+                </div>
+                
+                {(() => { // IIFE for complex render logic
+                    if (gameMode !== GameMode.UNSCRAMBLE && puzzle) {
+                        let filledCount = 0;
+                        return (
+                            <div id="answer-box" className="w-full bg-gray-900/50 rounded-lg min-h-[60px] p-3 flex items-center justify-center flex-wrap gap-2 text-3xl font-bold tracking-widest border-2 border-gray-600">
+                                {puzzle.display.map((char, index) => {
+                                    if (char === null) {
+                                        const filledChar = currentAnswer[filledCount] || '';
+                                        filledCount++;
+                                        return <div key={index} className="w-10 h-14 bg-gray-800 border-b-2 border-cyan-400 flex items-center justify-center">{filledChar}</div>;
+                                    }
+                                    if (char === ' ') return <div key={index} className="w-6 h-14" />;
+                                    return <div key={index} className="w-10 h-14 flex items-center justify-center">{char}</div>;
+                                })}
+                            </div>
+                        )
+                    }
+                    return (
+                         <div id="answer-box" className="w-full bg-gray-900/50 rounded-lg min-h-[60px] p-3 flex items-center justify-center text-3xl font-bold tracking-widest mb-4 border-2 border-gray-600">
+                            {currentAnswer || <span className="text-gray-500">Your Answer</span>}
+                        </div>
+                    );
+                })()}
+
+                <div className="flex flex-wrap gap-3 justify-center my-6">
+                    {(gameMode === GameMode.UNSCRAMBLE ? shuffledChars : choiceChars).map((char, index) => (
+                        <button key={index} onClick={() => handleCharClick(char, index)} className="w-12 h-12 bg-gray-700 text-2xl font-bold rounded-lg hover:bg-cyan-500 hover:text-gray-900 transition-colors">
+                            {char}
+                        </button>
+                    ))}
+                </div>
+
+                <div className="flex justify-center gap-4">
+                    <Button onClick={handleUndo} variant="secondary">Undo</Button>
+                    <Button onClick={handleClear} variant="secondary">Clear</Button>
+                    <Button onClick={handleSkip} variant="secondary" className="bg-amber-600 hover:bg-amber-500 focus:ring-amber-400">Skip (+30s)</Button>
+                </div>
             </div>
         );
     }
     
-    const renderChoiceButtons = () => {
-        const chars = gameMode === GameMode.UNSCRAMBLE ? shuffledChars : choiceChars;
-        return (
-             <div className="flex flex-wrap gap-3 justify-center my-6">
-                {chars.map((char, index) => (
-                    <button key={index} onClick={() => handleCharClick(char, index)} className="w-12 h-12 bg-gray-700 text-2xl font-bold rounded-lg hover:bg-cyan-500 hover:text-gray-900 transition-colors">
-                        {char}
-                    </button>
-                ))}
-            </div>
-        )
-    };
-
     return (
         <Card className="w-full max-w-2xl mx-auto">
             <style>{`
             @keyframes shake { 0%, 100% { transform: translateX(0); } 10%, 30%, 50%, 70%, 90% { transform: translateX(-5px); } 20%, 40%, 60%, 80% { transform: translateX(5px); } }
             .animate-shake { animation: shake 0.5s ease-in-out; }
             `}</style>
+            <audio ref={audioRef} src={currentQuestion.audioUrl} className="hidden" />
             <div className="flex justify-between items-center mb-4">
                 <h2 className="text-xl font-bold text-cyan-400">Question {currentQuestionIndex + 1} / {questions.length}</h2>
                 <div className="text-2xl font-mono text-white bg-gray-800 px-3 py-1 rounded-lg">
-                    {new Date(elapsedTime).toISOString().slice(14, 22)}
+                    {new Date(elapsedTime + penalty).toISOString().slice(14, 22)}
                 </div>
             </div>
-            <div className="my-6 text-center">
-                <p className="mb-4 text-gray-300">Listen to the audio and {gameMode === GameMode.UNSCRAMBLE ? 'unscramble the letters' : 'fill in the blanks'}.</p>
-                <audio ref={audioRef} src={currentQuestion.audioUrl} controls className="mx-auto" />
-            </div>
 
-            {renderAnswerArea()}
-            {renderChoiceButtons()}
-
-            <div className="flex justify-center gap-4">
-                <Button onClick={handleUndo} variant="secondary">Undo</Button>
-                <Button onClick={handleClear} variant="secondary">Clear</Button>
-                <Button onClick={handleSkip} variant="secondary" className="bg-amber-600 hover:bg-amber-500 focus:ring-amber-400">Skip (+30s)</Button>
-            </div>
+            {renderGameContent()}
             
-            {skippedCount > 0 && <p className="text-center mt-4 text-amber-400">Skipped: {skippedCount} ({skippedCount * (SKIP_PENALTY/1000)}s penalty)</p>}
+            {penalty > 0 && <p className="text-center mt-4 text-amber-400">Total Penalty: {penalty / 1000}s</p>}
         </Card>
     );
 };
